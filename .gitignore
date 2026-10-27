@@ -1,0 +1,31 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+dist/
+build/
+.venv/
+venv/
+env/
+
+# Environment / secrets
+.env
+*.local
+
+# Model cache
+.cache/
+
+# Test artifacts
+tests/baseline.json
+
+# Logs / outputs
+*.log
+*.txt
+wandb/
+
+# OS
+.DS_Store
+Thumbs.db

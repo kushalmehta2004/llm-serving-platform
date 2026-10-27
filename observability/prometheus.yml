@@ -1,0 +1,8 @@
+# TODO phase 6
+global:
+  scrape_interval: 15s
+
+scrape_configs:
+  - job_name: llm-serve
+    static_configs:
+      - targets: ["server:8000"]
