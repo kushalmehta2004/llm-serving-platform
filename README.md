@@ -102,15 +102,15 @@ python bench/plot.py   # writes bench/charts/*.png
 
 CPU results below (Qwen2.5-0.5B-Instruct, no GPU). GPU numbers will be higher by ~10–50×; the relative ordering is what matters.
 
-| Concurrency | Static (tok/s) | Paged (tok/s) | vLLM (tok/s) |
-|-------------|---------------|--------------|--------------|
-| 1 | 0.22 | 0.19 | — |
-| 4 | 0.76 | 0.66 | — |
-| 8 | 1.21 | 1.08 | — |
+| Concurrency | Static (tok/s) | Paged (tok/s) |
+|-------------|---------------|--------------|
+| 1 | 0.22 | 0.19 |
+| 4 | 0.76 | 0.66 |
+| 8 | **1.21** | **1.08** |
 
-**Note on CPU results:** On CPU, the paged scheduler is slightly slower than static due to the `to_dynamic_cache()` gather overhead on every decode step — a cost that disappears with a fused PagedAttention kernel on GPU. The throughput *scaling* with concurrency (5.5× from c1→c8 for static) is the meaningful signal.
+**5.5× throughput scaling** from concurrency 1 → 8 for static; 5.7× for paged.
 
-_Re-run with `--vllm-url` after `bash vllm/run.sh` to add the vLLM column._
+**Note on CPU vs GPU:** On CPU, paged is ~11% slower than static due to the `to_dynamic_cache()` gather on every decode step. On GPU with a fused PagedAttention kernel (what vLLM uses), paged pulls ahead — the gather disappears and memory fragmentation savings become significant. See the blog post (`BLOG_POST_DRAFT.md`) for a detailed breakdown of the architectural gap between this implementation and vLLM.
 
 ## Running the observability stack
 
