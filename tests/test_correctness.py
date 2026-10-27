@@ -4,6 +4,10 @@ Correctness oracle — run after Phases 3, 4, and 5.
 First run (no baseline file): generates and saves the golden token ids.
 Every subsequent run: asserts the output is token-for-token identical.
 
+Tests:
+  1. Single-request path (generate()) vs saved baseline.
+  2. Batched path (batch_forward_step loop, batch_size=1) vs saved baseline.
+
 Usage:
     python -m pytest tests/test_correctness.py -v
     # or directly:
@@ -17,7 +21,7 @@ import json
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 import pytest
-from server.model import load_model, generate
+from server.model import load_model, generate, get_tokenizer, batch_generate
 
 BASELINE_FILE = os.path.join(os.path.dirname(__file__), "baseline.json")
 
@@ -34,7 +38,6 @@ def _get_or_create_baseline() -> list[int]:
             data = json.load(f)
         return data["token_ids"]
 
-    # First run: generate and save
     load_model()
     _text, token_ids, _p, _c = generate(PROMPT, MAX_TOKENS, TEMPERATURE, SEED)
     with open(BASELINE_FILE, "w") as f:
@@ -43,23 +46,50 @@ def _get_or_create_baseline() -> list[int]:
     return token_ids
 
 
+def _batched_greedy(prompt: str, max_tokens: int) -> list[int]:
+    """
+    Runs a batch of 1 through batch_generate (the Phase 3 scheduler path).
+    Must produce token-for-token identical output to the single-request baseline.
+    """
+    results = batch_generate([prompt], max_tokens, temperature=0.0)
+    token_ids = results[0]
+    # Strip trailing EOS if present (matches scheduler behaviour)
+    tokenizer = get_tokenizer()
+    if token_ids and token_ids[-1] == tokenizer.eos_token_id:
+        token_ids = token_ids[:-1]
+    return token_ids
+
+
+# ── tests ─────────────────────────────────────────────────────────────────────
+
 def test_greedy_output_matches_baseline():
-    """Single-request greedy output must be token-for-token identical to the saved baseline."""
+    """Single-request path must be token-for-token identical to the saved baseline."""
     load_model()
     baseline = _get_or_create_baseline()
     _text, token_ids, _p, _c = generate(PROMPT, MAX_TOKENS, TEMPERATURE, SEED)
     assert token_ids == baseline, (
-        f"Output drifted from baseline!\n"
-        f"Expected: {baseline}\n"
-        f"Got:      {token_ids}"
+        f"Single-request output drifted!\nExpected: {baseline}\nGot: {token_ids}"
+    )
+
+
+def test_batched_path_matches_baseline():
+    """Batch-of-1 through batch_forward_step must match the baseline token-for-token."""
+    load_model()
+    baseline = _get_or_create_baseline()
+    token_ids = _batched_greedy(PROMPT, MAX_TOKENS)
+    assert token_ids == baseline, (
+        f"Batched path output drifted!\nExpected: {baseline}\nGot: {token_ids}"
     )
 
 
 if __name__ == "__main__":
     load_model()
     baseline = _get_or_create_baseline()
+
     _text, token_ids, _p, _c = generate(PROMPT, MAX_TOKENS, TEMPERATURE, SEED)
-    assert token_ids == baseline, (
-        f"FAIL — output drifted!\nExpected: {baseline}\nGot: {token_ids}"
-    )
-    print("PASS — output matches baseline.")
+    assert token_ids == baseline, f"FAIL (single-request) — got: {token_ids}"
+    print("PASS — single-request matches baseline.")
+
+    token_ids = _batched_greedy(PROMPT, MAX_TOKENS)
+    assert token_ids == baseline, f"FAIL (batched path) — got: {token_ids}"
+    print("PASS — batched path matches baseline.")

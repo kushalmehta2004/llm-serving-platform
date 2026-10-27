@@ -1,12 +1,14 @@
 """
 Phase 1 — single-request OpenAI-compatible completion endpoint.
-Phase 2 — stream=true via SSE (text/event-stream).
+Phase 2 — stream=true via SSE.
+Phase 3 — requests go through the queue + static batching scheduler.
 """
 
 import json
+import os
 import time
 import uuid
-import os
+import asyncio
 from typing import AsyncGenerator, Literal
 
 from fastapi import FastAPI
@@ -14,11 +16,16 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 from dotenv import load_dotenv
 
-from server.model import load_model, generate, generate_stream
+from server.model import load_model, get_tokenizer
+from server.queue import RequestQueue, Request
+from server.scheduler import StaticBatchScheduler
 
 load_dotenv()
 
 app = FastAPI(title="LLM Serving Platform")
+
+_request_queue: RequestQueue | None = None
+_scheduler: StaticBatchScheduler | None = None
 
 
 # ── Request / response schemas (OpenAI-compatible) ───────────────────────────
@@ -62,13 +69,17 @@ class ChatCompletionResponse(BaseModel):
 
 @app.on_event("startup")
 async def startup():
+    global _request_queue, _scheduler
     load_model()
+    _request_queue = RequestQueue()
+    max_batch = int(os.environ.get("MAX_BATCH", 8))
+    _scheduler = StaticBatchScheduler(_request_queue, max_batch=max_batch)
+    _scheduler.start()
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
 def _messages_to_prompt(messages: list[ChatMessage]) -> str:
-    from server.model import get_tokenizer
     tokenizer = get_tokenizer()
     if hasattr(tokenizer, "apply_chat_template"):
         return tokenizer.apply_chat_template(
@@ -81,23 +92,40 @@ def _messages_to_prompt(messages: list[ChatMessage]) -> str:
     return "\n".join(parts)
 
 
-async def _stream_response(
-    req: ChatCompletionRequest,
-    prompt: str,
-    completion_id: str,
-    created: int,
-) -> AsyncGenerator[str, None]:
-    """Yields OpenAI-style SSE chunks then a [DONE] sentinel."""
-    from server.model import get_tokenizer
-    tokenizer = get_tokenizer()
-
-    for token_id, _prompt_len in generate_stream(
+def _make_request(req: ChatCompletionRequest, prompt: str) -> Request:
+    return Request(
         prompt=prompt,
         max_tokens=req.max_tokens,
         temperature=req.temperature,
         seed=req.seed,
-    ):
-        token_text = tokenizer.decode([token_id], skip_special_tokens=True)
+        output_queue=asyncio.Queue(),
+        loop=asyncio.get_event_loop(),
+    )
+
+
+async def _collect_tokens(output_queue: asyncio.Queue) -> list[int]:
+    """Drain the output queue until the None sentinel, return all token ids."""
+    tokens = []
+    while True:
+        tok = await output_queue.get()
+        if tok is None:
+            break
+        tokens.append(tok)
+    return tokens
+
+
+async def _stream_from_queue(
+    req: ChatCompletionRequest,
+    output_queue: asyncio.Queue,
+    completion_id: str,
+    created: int,
+) -> AsyncGenerator[str, None]:
+    tokenizer = get_tokenizer()
+    while True:
+        tok = await output_queue.get()
+        if tok is None:
+            break
+        token_text = tokenizer.decode([tok], skip_special_tokens=True)
         chunk = {
             "id": completion_id,
             "object": "chat.completion.chunk",
@@ -113,7 +141,6 @@ async def _stream_response(
         }
         yield f"data: {json.dumps(chunk)}\n\n"
 
-    # Final chunk with finish_reason
     final = {
         "id": completion_id,
         "object": "chat.completion.chunk",
@@ -133,19 +160,23 @@ async def chat_completions(req: ChatCompletionRequest):
     completion_id = f"chatcmpl-{uuid.uuid4().hex}"
     created = int(time.time())
 
+    request = _make_request(req, prompt)
+    _request_queue.enqueue(request)
+
     if req.stream:
         return StreamingResponse(
-            _stream_response(req, prompt, completion_id, created),
+            _stream_from_queue(req, request.output_queue, completion_id, created),
             media_type="text/event-stream",
         )
 
-    # Non-streaming path (Phase 1) — unchanged
-    text, _token_ids, prompt_tokens, completion_tokens = generate(
-        prompt=prompt,
-        max_tokens=req.max_tokens,
-        temperature=req.temperature,
-        seed=req.seed,
-    )
+    # Non-streaming: wait for all tokens then return
+    token_ids = await _collect_tokens(request.output_queue)
+    tokenizer = get_tokenizer()
+
+    # prompt_tokens: re-tokenize to get count
+    prompt_token_count = len(tokenizer(prompt)["input_ids"])
+
+    text = tokenizer.decode(token_ids, skip_special_tokens=True)
     return ChatCompletionResponse(
         id=completion_id,
         created=created,
@@ -158,9 +189,9 @@ async def chat_completions(req: ChatCompletionRequest):
             )
         ],
         usage=Usage(
-            prompt_tokens=prompt_tokens,
-            completion_tokens=completion_tokens,
-            total_tokens=prompt_tokens + completion_tokens,
+            prompt_tokens=prompt_token_count,
+            completion_tokens=len(token_ids),
+            total_tokens=prompt_token_count + len(token_ids),
         ),
     )
 

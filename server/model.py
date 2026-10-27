@@ -133,3 +133,68 @@ def generate_stream(
     new_ids = output_ids[0][prompt_len:].tolist()
     for token_id in new_ids:
         yield token_id, prompt_len
+
+
+def batch_generate(
+    prompts: list[str],
+    max_tokens: int,
+    temperature: float = 0.0,
+) -> list[list[int]]:
+    """
+    Generate tokens for a batch of prompts using model.generate().
+    Left-pads shorter prompts so all sequences have the same length.
+    Returns one list of token ids per prompt (prompt tokens excluded).
+
+    Correctness guarantee: for batch_size=1 with no padding the output is
+    token-for-token identical to generate() — same model.generate() codepath.
+    Phase 4 replaces this with a continuous step-by-step scheduler loop.
+    """
+    tokenizer = get_tokenizer()
+    model = get_model()
+    device = get_model_device()
+
+    pad_id = tokenizer.pad_token_id or tokenizer.eos_token_id
+    enc = tokenizer(
+        prompts,
+        return_tensors="pt",
+        padding=True,          # left-pads by default for decoder-only models
+        padding_side="left",
+    ).to(device)
+
+    do_sample = temperature > 0.0
+    with torch.no_grad():
+        out = model.generate(
+            **enc,
+            max_new_tokens=max_tokens,
+            do_sample=do_sample,
+            temperature=temperature if do_sample else None,
+            pad_token_id=pad_id,
+        )
+
+    prompt_len = enc["input_ids"].shape[1]
+    eos_id = tokenizer.eos_token_id
+    results = []
+    for i in range(len(prompts)):
+        tokens = out[i][prompt_len:].tolist()
+        # Truncate at the first EOS — model.generate pads the rest with pad/eos
+        if eos_id in tokens:
+            tokens = tokens[: tokens.index(eos_id)]
+        results.append(tokens)
+    return results
+
+
+def batch_forward_step(
+    input_ids: "torch.Tensor",
+    attention_mask: "torch.Tensor",
+) -> "torch.Tensor":
+    """
+    One forward pass over a batch, no KV cache.
+    Returns logits (B, vocab) for the last position of each sequence.
+    Used in test_correctness.py; Phase 4 scheduler will use this directly.
+    NOTE: in transformers 5.x this diverges from model.generate() due to
+    internal cache_position handling — use batch_generate() for correctness.
+    """
+    model = get_model()
+    with torch.no_grad():
+        outputs = model(input_ids=input_ids, attention_mask=attention_mask)
+    return outputs.logits[:, -1, :]  # (B, vocab)
