@@ -26,7 +26,7 @@ python scripts/smoke.py        # Phase 0 acceptance check
 |-------|------|--------|
 | 0 | Scaffold + model load | ✅ |
 | 1 | Single-request endpoint | ✅ |
-| 2 | SSE streaming | 🔲 |
+| 2 | SSE streaming | ✅ |
 | 3 | Static batching | 🔲 |
 | 4 | Continuous batching | 🔲 |
 | 5 | Paged KV cache | 🔲 |

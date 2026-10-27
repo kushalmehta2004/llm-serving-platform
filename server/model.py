@@ -84,6 +84,32 @@ def generate(
     Full generation with greedy (temperature=0) or sampled decoding.
     Returns (text, output_token_ids, prompt_tokens, completion_tokens).
     This is the single-request path and the correctness oracle for all later phases.
+    Internally delegates to generate_stream and collects all tokens.
+    """
+    token_ids: list[int] = []
+    prompt_tokens = 0
+    for token_id, p_len in generate_stream(prompt, max_tokens, temperature, seed):
+        token_ids.append(token_id)
+        prompt_tokens = p_len  # same every iteration
+
+    tokenizer = get_tokenizer()
+    text = tokenizer.decode(token_ids, skip_special_tokens=True)
+    return text, token_ids, prompt_tokens, len(token_ids)
+
+
+def generate_stream(
+    prompt: str,
+    max_tokens: int = 256,
+    temperature: float = 1.0,
+    seed: int | None = None,
+):
+    """
+    Token-by-token generator. Yields (token_id, prompt_len) for each new token.
+    Used by the streaming endpoint; generate() collects these into a full result.
+
+    Phase 2: uses model.generate() then streams the result token-by-token —
+    identical sequence to generate(), only the delivery changes.
+    Phase 3/4 will replace this with a true step-by-step loop for the scheduler.
     """
     tokenizer = get_tokenizer()
     model = get_model()
@@ -105,5 +131,5 @@ def generate(
         )
 
     new_ids = output_ids[0][prompt_len:].tolist()
-    text = tokenizer.decode(new_ids, skip_special_tokens=True)
-    return text, new_ids, prompt_len, len(new_ids)
+    for token_id in new_ids:
+        yield token_id, prompt_len
