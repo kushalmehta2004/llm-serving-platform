@@ -185,7 +185,7 @@ def main():
 
     for name, url in targets.items():
         for conc in args.concurrency:
-            print(f"\n▶ {name}  concurrency={conc}  n={args.n_requests}")
+            print(f"\n>> {name}  concurrency={conc}  n={args.n_requests}")
             metrics = asyncio.run(
                 _benchmark(url, conc, args.n_requests, args.max_tokens)
             )
