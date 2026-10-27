@@ -27,6 +27,15 @@ If request A generates 200 tokens and request B generates 10, B must wait for A 
 
 The short request gets **2.55× lower latency** under continuous batching.
 
+And throughput at concurrency 8 (CPU, 20 requests, max_tokens=32):
+
+| Scheduler | Throughput (tok/s) | P50 latency |
+|-----------|-------------------|-------------|
+| Static batching | 1.21 | 130 s |
+| Paged KV (Phase 5) | 1.08 | 138 s |
+
+Static is ~12% faster than paged on CPU because `to_dynamic_cache()` gathers paged blocks into a contiguous tensor on every decode step. On GPU with a fused PagedAttention kernel, paged pulls ahead — it avoids the O(T) gather entirely and handles memory fragmentation that static batching can't.
+
 ---
 
 ## Continuous Batching: The Key Idea
@@ -111,6 +120,8 @@ The catch: without a custom CUDA kernel (PagedAttention), `to_dynamic_cache()` g
 ---
 
 ## Where vLLM Wins and Why
+
+vLLM requires Linux + NVIDIA GPU; the benchmark below is the CPU result for the from-scratch server only. The structural gap analysis holds regardless of hardware:
 
 After benchmarking, here's the honest accounting of the remaining gap:
 

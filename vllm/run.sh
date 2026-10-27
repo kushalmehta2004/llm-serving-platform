@@ -1,14 +1,20 @@
 #!/usr/bin/env bash
 # Phase 6 — serve the same MODEL_ID via vLLM (OpenAI-compatible endpoint).
 #
-# Usage:
+# Requirements: Linux + NVIDIA GPU + vLLM installed.
+#   pip install vllm
+#
+# Usage (from project root, outside the vllm/ subdirectory):
 #   source .env && bash vllm/run.sh
 #   VLLM_PORT=8001 bash vllm/run.sh
 #
+# NOTE: Run from the project root, not from inside vllm/ — otherwise
+# Python's import system shadows the real vLLM with this directory.
+#
 # Tuning knobs:
-#   --max-num-seqs        max concurrent sequences (default: 256)
-#   --gpu-memory-utilization  fraction of GPU VRAM to reserve for KV cache (default: 0.90)
-#   --max-model-len       context window; reduce to save memory on small GPUs
+#   --max-num-seqs            max concurrent sequences (default: 256)
+#   --gpu-memory-utilization  fraction of GPU VRAM for KV cache (default: 0.90)
+#   --max-model-len           context window; reduce to save memory on small GPUs
 
 set -euo pipefail
 

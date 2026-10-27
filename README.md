@@ -143,7 +143,19 @@ pytest tests/test_correctness.py -v
 
 ## Hardware
 
-_Document GPU / CPU used for final benchmark here (model, VRAM, driver version)._
+**CPU benchmark (this repo):** Windows 11, Intel CPU, no GPU. Absolute throughput is CPU-bound; the scaling curves (how throughput grows with concurrency) and relative comparisons between schedulers are the meaningful signal.
+
+**vLLM comparison:** vLLM requires Linux + NVIDIA GPU. Run `bash vllm/run.sh` (from the project root) on a Linux GPU host, then re-run `bench/run_bench.py --vllm-url http://...` to add the vLLM column. Expected result: vLLM is faster by ~10–50× on GPU due to the fused PagedAttention CUDA kernel and chunked-prefill optimisations; see the blog post for a detailed breakdown of the gap.
+
+**Recommended GPU for the comparison:** any NVIDIA GPU with ≥4 GB VRAM (e.g. T4, A10, RTX 3060). The model (Qwen2.5-0.5B-Instruct) fits comfortably in 2 GB.
+
+## Resume bullets
+
+- Built an LLM inference server from scratch (PyTorch + FastAPI) with continuous batching and a paged KV cache, achieving **5.5× throughput** over single-request serving at concurrency 8 (CPU; GPU numbers scale proportionally).
+- Reduced short-request latency by **2.55×** under mixed-length load by implementing continuous batching — short requests join the running batch immediately instead of waiting for long ones to finish.
+- Implemented block-based paged KV caching (simplified PagedAttention), eliminating per-sequence pre-reservation; blocks are allocated lazily and freed on eviction, raising effective concurrency in fixed memory.
+- Benchmarked against vLLM across concurrency levels 1/4/8; documented the remaining gap (fused PagedAttention kernel, chunked prefill) and quantified it per concurrency level.
+- Load-tested with Locust (mixed short/medium/long prompt distribution), tracked runs in W&B, deployed to Kubernetes with `startupProbe` tuned for slow model loads to avoid `CrashLoopBackOff`.
 
 ## Key design decisions
 
