@@ -1,0 +1,37 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: llm-server
+  namespace: llm-serving
+  labels:
+    app: llm-server
+spec:
+  selector:
+    app: llm-server
+  ports:
+    - name: http
+      port: 80
+      targetPort: 8000
+      protocol: TCP
+  type: ClusterIP
+---
+# NodePort service for local kind/k3d access without an ingress controller.
+# Access via:  kubectl port-forward svc/llm-server-nodeport 8000:8000 -n llm-serving
+# Or directly: http://<node-ip>:30800
+apiVersion: v1
+kind: Service
+metadata:
+  name: llm-server-nodeport
+  namespace: llm-serving
+  labels:
+    app: llm-server
+spec:
+  selector:
+    app: llm-server
+  ports:
+    - name: http
+      port: 8000
+      targetPort: 8000
+      nodePort: 30800
+      protocol: TCP
+  type: NodePort

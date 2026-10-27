@@ -1,0 +1,21 @@
+# Horizontal Pod Autoscaler — scales on CPU utilization.
+# For GPU serving, replace with a custom metric (e.g. queue depth via KEDA).
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: llm-server
+  namespace: llm-serving
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: llm-server
+  minReplicas: 1
+  maxReplicas: 4
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 70

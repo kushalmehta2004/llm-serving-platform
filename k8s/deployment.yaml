@@ -1,0 +1,106 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: llm-server
+  namespace: llm-serving
+  labels:
+    app: llm-server
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: llm-server
+  template:
+    metadata:
+      labels:
+        app: llm-server
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8000"
+        prometheus.io/path: "/metrics"
+    spec:
+      containers:
+        - name: llm-server
+          image: llm-serving-platform:latest
+          # Use imagePullPolicy: Never when loading a locally-built image into kind/k3d:
+          #   docker build -t llm-serving-platform:latest .
+          #   kind load docker-image llm-serving-platform:latest
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 8000
+              name: http
+          envFrom:
+            - configMapRef:
+                name: llm-server-config
+          # Optional: HF token for gated models
+          # env:
+          #   - name: HF_TOKEN
+          #     valueFrom:
+          #       secretKeyRef:
+          #         name: hf-secret
+          #         key: token
+
+          resources:
+            requests:
+              cpu: "2"
+              memory: "4Gi"
+            limits:
+              cpu: "4"
+              memory: "8Gi"
+            # Uncomment for GPU nodes:
+            # limits:
+            #   nvidia.com/gpu: "1"
+
+          volumeMounts:
+            - name: hf-cache
+              mountPath: /root/.cache/huggingface
+
+          # ── Probes ────────────────────────────────────────────────────────
+          # The model takes ~30s to download + load on first run.
+          # Without a long initialDelaySeconds the kubelet marks the pod
+          # NotReady, restarts it, and it CrashLoopBackoffs — the designed-in
+          # war story for Phase 7.
+          #
+          # Fix: give the container 120s before the first probe, then allow
+          # 3 consecutive failures at 10s intervals before giving up.
+          # Together that tolerates up to 150s of startup.
+          startupProbe:
+            httpGet:
+              path: /health
+              port: 8000
+            # Poll every 10s; allow up to 30 consecutive failures = 300s budget.
+            # Once startupProbe succeeds, liveness/readiness take over.
+            failureThreshold: 30
+            periodSeconds: 10
+
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8000
+            initialDelaySeconds: 0   # startupProbe already gated startup
+            periodSeconds: 10
+            failureThreshold: 3
+
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8000
+            initialDelaySeconds: 0
+            periodSeconds: 30
+            failureThreshold: 3
+
+      volumes:
+        - name: hf-cache
+          # Use a hostPath on kind/k3d for fast local dev (no repeated downloads).
+          # Replace with a PersistentVolumeClaim in production.
+          hostPath:
+            path: /tmp/hf-cache
+            type: DirectoryOrCreate
+
+      # GPU node selector — uncomment when targeting a GPU node pool:
+      # nodeSelector:
+      #   accelerator: nvidia-tesla-t4
+      # tolerations:
+      #   - key: "nvidia.com/gpu"
+      #     operator: "Exists"
+      #     effect: "NoSchedule"
