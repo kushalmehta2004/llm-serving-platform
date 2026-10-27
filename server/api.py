@@ -18,14 +18,14 @@ from dotenv import load_dotenv
 
 from server.model import load_model, get_tokenizer
 from server.queue import RequestQueue, Request
-from server.scheduler import StaticBatchScheduler
+from server.scheduler import ContinuousBatchScheduler, StaticBatchScheduler
 
 load_dotenv()
 
 app = FastAPI(title="LLM Serving Platform")
 
 _request_queue: RequestQueue | None = None
-_scheduler: StaticBatchScheduler | None = None
+_scheduler = None
 
 
 # ── Request / response schemas (OpenAI-compatible) ───────────────────────────
@@ -73,7 +73,11 @@ async def startup():
     load_model()
     _request_queue = RequestQueue()
     max_batch = int(os.environ.get("MAX_BATCH", 8))
-    _scheduler = StaticBatchScheduler(_request_queue, max_batch=max_batch)
+    scheduler_type = os.environ.get("SCHEDULER", "continuous")
+    if scheduler_type == "static":
+        _scheduler = StaticBatchScheduler(_request_queue, max_batch=max_batch)
+    else:
+        _scheduler = ContinuousBatchScheduler(_request_queue, max_batch=max_batch)
     _scheduler.start()
 
 

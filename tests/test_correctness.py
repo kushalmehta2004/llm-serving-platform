@@ -21,7 +21,9 @@ import json
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 import pytest
-from server.model import load_model, generate, get_tokenizer, batch_generate
+from server.model import load_model, generate, get_tokenizer, batch_generate, decode_step, get_model_device
+from transformers import DynamicCache
+import torch
 
 BASELINE_FILE = os.path.join(os.path.dirname(__file__), "baseline.json")
 
@@ -79,6 +81,41 @@ def test_batched_path_matches_baseline():
     token_ids = _batched_greedy(PROMPT, MAX_TOKENS)
     assert token_ids == baseline, (
         f"Batched path output drifted!\nExpected: {baseline}\nGot: {token_ids}"
+    )
+
+
+def test_kv_cache_decode_matches_baseline():
+    """Phase 4 KV-cache decode loop must match baseline token-for-token."""
+    load_model()
+    baseline = _get_or_create_baseline()
+    tokenizer = get_tokenizer()
+    device = get_model_device()
+
+    enc = tokenizer(PROMPT, return_tensors="pt").to(device)
+    ids  = enc["input_ids"]
+    mask = enc["attention_mask"]
+    L = ids.shape[1]
+
+    past_kv = DynamicCache()
+    cache_pos = torch.arange(L, dtype=torch.long, device=device)
+    logits, past_kv = decode_step(ids, mask, past_kv, cache_pos)
+
+    token_ids = []
+    tok = int(logits[0].argmax().item())
+    token_ids.append(tok)
+
+    for step in range(1, MAX_TOKENS):
+        if tok == tokenizer.eos_token_id:
+            break
+        inp = torch.tensor([[tok]], dtype=torch.long, device=device)
+        cur_mask = torch.ones((1, L + step), dtype=torch.long, device=device)
+        cache_pos = torch.tensor([L + step - 1], dtype=torch.long, device=device)
+        logits, past_kv = decode_step(inp, cur_mask, past_kv, cache_pos)
+        tok = int(logits[0].argmax().item())
+        token_ids.append(tok)
+
+    assert token_ids == baseline, (
+        f"KV-cache decode path drifted!\nExpected: {baseline}\nGot: {token_ids}"
     )
 
 

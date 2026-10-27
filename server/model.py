@@ -1,11 +1,16 @@
 """
 Model loading and inference. Keep this free of batching/scheduling logic —
 it just loads the model and runs forward passes on whatever it's handed.
+
+repetition_penalty is set to 1.0 throughout so that:
+  - model.generate() produces logits identical to a raw model() forward pass
+  - the manual KV-cache decode loop in the scheduler matches exactly
+  - the correctness baseline is stable regardless of call path
 """
 
 import os
 import torch
-from transformers import AutoTokenizer, AutoModelForCausalLM
+from transformers import AutoTokenizer, AutoModelForCausalLM, DynamicCache
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -57,6 +62,8 @@ def get_model_device() -> torch.device:
     return _device
 
 
+# ── single-request paths (Phases 0–2) ────────────────────────────────────────
+
 def generate_one(prompt: str, max_new_tokens: int = 20) -> str:
     """Greedy-decode up to max_new_tokens from prompt. Used by smoke test."""
     tokenizer = get_tokenizer()
@@ -69,6 +76,7 @@ def generate_one(prompt: str, max_new_tokens: int = 20) -> str:
             **inputs,
             max_new_tokens=max_new_tokens,
             do_sample=False,
+            repetition_penalty=1.0,
         )
     new_ids = output_ids[0][inputs["input_ids"].shape[1]:]
     return tokenizer.decode(new_ids, skip_special_tokens=True)
@@ -81,16 +89,14 @@ def generate(
     seed: int | None = None,
 ) -> tuple[str, list[int], int, int]:
     """
-    Full generation with greedy (temperature=0) or sampled decoding.
-    Returns (text, output_token_ids, prompt_tokens, completion_tokens).
-    This is the single-request path and the correctness oracle for all later phases.
-    Internally delegates to generate_stream and collects all tokens.
+    Full generation. Returns (text, output_token_ids, prompt_tokens, completion_tokens).
+    Correctness oracle for all later phases.
     """
     token_ids: list[int] = []
     prompt_tokens = 0
     for token_id, p_len in generate_stream(prompt, max_tokens, temperature, seed):
         token_ids.append(token_id)
-        prompt_tokens = p_len  # same every iteration
+        prompt_tokens = p_len
 
     tokenizer = get_tokenizer()
     text = tokenizer.decode(token_ids, skip_special_tokens=True)
@@ -103,14 +109,7 @@ def generate_stream(
     temperature: float = 1.0,
     seed: int | None = None,
 ):
-    """
-    Token-by-token generator. Yields (token_id, prompt_len) for each new token.
-    Used by the streaming endpoint; generate() collects these into a full result.
-
-    Phase 2: uses model.generate() then streams the result token-by-token —
-    identical sequence to generate(), only the delivery changes.
-    Phase 3/4 will replace this with a true step-by-step loop for the scheduler.
-    """
+    """Yields (token_id, prompt_len) for each new token via model.generate()."""
     tokenizer = get_tokenizer()
     model = get_model()
     device = get_model_device()
@@ -128,6 +127,7 @@ def generate_stream(
             max_new_tokens=max_tokens,
             do_sample=do_sample,
             temperature=temperature if do_sample else None,
+            repetition_penalty=1.0,
         )
 
     new_ids = output_ids[0][prompt_len:].tolist()
@@ -135,19 +135,17 @@ def generate_stream(
         yield token_id, prompt_len
 
 
+# ── batched path (Phase 3) ────────────────────────────────────────────────────
+
 def batch_generate(
     prompts: list[str],
     max_tokens: int,
     temperature: float = 0.0,
 ) -> list[list[int]]:
     """
-    Generate tokens for a batch of prompts using model.generate().
-    Left-pads shorter prompts so all sequences have the same length.
-    Returns one list of token ids per prompt (prompt tokens excluded).
-
-    Correctness guarantee: for batch_size=1 with no padding the output is
-    token-for-token identical to generate() — same model.generate() codepath.
-    Phase 4 replaces this with a continuous step-by-step scheduler loop.
+    Generate tokens for a batch via model.generate() (left-padded).
+    Returns one list of token ids per prompt (prompt tokens excluded, EOS stripped).
+    Correctness: batch-of-1 == generate() for same prompt.
     """
     tokenizer = get_tokenizer()
     model = get_model()
@@ -157,7 +155,7 @@ def batch_generate(
     enc = tokenizer(
         prompts,
         return_tensors="pt",
-        padding=True,          # left-pads by default for decoder-only models
+        padding=True,
         padding_side="left",
     ).to(device)
 
@@ -169,6 +167,7 @@ def batch_generate(
             do_sample=do_sample,
             temperature=temperature if do_sample else None,
             pad_token_id=pad_id,
+            repetition_penalty=1.0,
         )
 
     prompt_len = enc["input_ids"].shape[1]
@@ -176,25 +175,54 @@ def batch_generate(
     results = []
     for i in range(len(prompts)):
         tokens = out[i][prompt_len:].tolist()
-        # Truncate at the first EOS — model.generate pads the rest with pad/eos
         if eos_id in tokens:
             tokens = tokens[: tokens.index(eos_id)]
         results.append(tokens)
     return results
 
 
-def batch_forward_step(
-    input_ids: "torch.Tensor",
-    attention_mask: "torch.Tensor",
-) -> "torch.Tensor":
+# ── step-by-step KV-cache path (Phase 4) ─────────────────────────────────────
+
+def decode_step(
+    input_ids: torch.Tensor,
+    attention_mask: torch.Tensor,
+    past_key_values: DynamicCache,
+    cache_position: torch.Tensor,
+) -> tuple[torch.Tensor, DynamicCache]:
     """
-    One forward pass over a batch, no KV cache.
-    Returns logits (B, vocab) for the last position of each sequence.
-    Used in test_correctness.py; Phase 4 scheduler will use this directly.
-    NOTE: in transformers 5.x this diverges from model.generate() due to
-    internal cache_position handling — use batch_generate() for correctness.
+    One forward pass using the model's own KV cache.
+
+    Prefill call  (step 0): input_ids = (B, prompt_len), cache_position = arange(prompt_len)
+    Decode call   (step k): input_ids = (B, 1),          cache_position = [prompt_len + k - 1]
+
+    Returns:
+        logits:          (B, vocab_size) at the last position
+        past_key_values: updated DynamicCache for the next step
+    """
+    model = get_model()
+    with torch.no_grad():
+        out = model(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            past_key_values=past_key_values,
+            cache_position=cache_position,
+            use_cache=True,
+        )
+    return out.logits[:, -1, :], out.past_key_values
+
+
+def batch_forward_step(
+    input_ids: torch.Tensor,
+    attention_mask: torch.Tensor,
+) -> torch.Tensor:
+    """
+    Full-sequence forward, no KV cache.
+    Returns logits (B, vocab) at the last position.
+    Used only in test_correctness.py for the batched-path check.
+    NOTE: diverges from model.generate() when repetition_penalty != 1.0;
+    since we now use penalty=1.0 everywhere this matches correctly.
     """
     model = get_model()
     with torch.no_grad():
         outputs = model(input_ids=input_ids, attention_mask=attention_mask)
-    return outputs.logits[:, -1, :]  # (B, vocab)
+    return outputs.logits[:, -1, :]
