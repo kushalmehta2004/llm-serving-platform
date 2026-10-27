@@ -21,7 +21,8 @@ import json
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 import pytest
-from server.model import load_model, generate, get_tokenizer, batch_generate, decode_step, get_model_device
+from server.model import load_model, generate, get_tokenizer, batch_generate, decode_step, decode_step_paged, get_model_device
+from server.kv_cache import make_pool_from_model, SequenceKV
 from transformers import DynamicCache
 import torch
 
@@ -116,6 +117,59 @@ def test_kv_cache_decode_matches_baseline():
 
     assert token_ids == baseline, (
         f"KV-cache decode path drifted!\nExpected: {baseline}\nGot: {token_ids}"
+    )
+
+
+def test_paged_kv_cache_matches_baseline():
+    """Phase 5: paged KV cache decode must be token-for-token identical to baseline."""
+    load_model()
+    baseline = _get_or_create_baseline()
+    tokenizer = get_tokenizer()
+    device    = get_model_device()
+
+    pool   = make_pool_from_model(num_blocks=64, block_size=8)
+    assert pool.num_free == 64, "Pool should start full"
+
+    seq_kv = SequenceKV(pool)
+
+    enc  = tokenizer(PROMPT, return_tensors="pt").to(device)
+    ids  = enc["input_ids"]
+    mask = enc["attention_mask"]
+    L    = ids.shape[1]
+
+    # Prefill: fill KV for all prompt tokens via DynamicCache, then copy to paged storage
+    past_kv   = DynamicCache()
+    cache_pos = torch.arange(L, dtype=torch.long, device=device)
+    logits, past_kv = decode_step(ids, mask, past_kv, cache_pos)
+    for tok_pos in range(L):
+        seq_kv.write_token(past_kv, tok_pos)
+    # seq_kv.num_tokens == L now
+
+    token_ids = []
+    tok = int(logits[0].argmax().item())
+    token_ids.append(tok)   # first generated token (from prefill logits)
+
+    # Decode loop: mirrors test_kv_cache_decode_matches_baseline exactly,
+    # but uses decode_step_paged (gather from pages → model → write back to pages).
+    for step in range(1, MAX_TOKENS):
+        if tok == tokenizer.eos_token_id:
+            break
+        # seq_kv has L + (step-1) tokens stored (prompt + previously generated)
+        cur_len   = L + step - 1        # tokens in cache before this step
+        inp       = torch.tensor([[tok]], dtype=torch.long, device=device)
+        cur_mask  = torch.ones((1, cur_len + 1), dtype=torch.long, device=device)
+        cache_pos = torch.tensor([cur_len], dtype=torch.long, device=device)
+        logits, _ = decode_step_paged(inp, cur_mask, seq_kv, cache_pos)
+        tok = int(logits[0].argmax().item())
+        token_ids.append(tok)
+    # seq_kv.num_tokens == L + len(token_ids) - 1
+
+    # Verify no block leaks: all blocks returned after free
+    seq_kv.free()
+    assert pool.num_free == 64, f"Block leak! pool.num_free={pool.num_free} expected 64"
+
+    assert token_ids == baseline, (
+        f"Paged KV cache output drifted!\nExpected: {baseline}\nGot: {token_ids}"
     )
 
 

@@ -211,6 +211,31 @@ def decode_step(
     return out.logits[:, -1, :], out.past_key_values
 
 
+def decode_step_paged(
+    input_ids: torch.Tensor,
+    attention_mask: torch.Tensor,
+    seq_kv,          # server.kv_cache.SequenceKV
+    cache_position: torch.Tensor,
+) -> tuple[torch.Tensor, None]:
+    """
+    One decode step using the paged KV cache.
+
+    Reconstructs a DynamicCache from paged blocks, runs the model forward,
+    writes the new token's KV back into the paged store, then discards the
+    temporary DynamicCache.
+
+    Returns:
+        logits  : (1, vocab_size) at the last position
+        None    : caller should use seq_kv for subsequent steps, not a cache object
+    """
+    past_kv = seq_kv.to_dynamic_cache()
+    logits, updated_kv = decode_step(input_ids, attention_mask, past_kv, cache_position)
+    # Write the newly computed token's KV (last position in updated_kv)
+    new_pos = seq_kv.num_tokens        # 0-indexed position of the token just processed
+    seq_kv.write_token(updated_kv, new_pos)
+    return logits, None
+
+
 def batch_forward_step(
     input_ids: torch.Tensor,
     attention_mask: torch.Tensor,

@@ -1,5 +1,5 @@
 """
-Phase 4 — continuous batching scheduler.
+Phase 4/5 — continuous batching scheduler (with optional paged KV cache).
 
 Key difference from Phase 3 (static batching):
   Static batching: dequeue a batch, wait for ALL to finish, then dequeue again.
@@ -24,7 +24,8 @@ from typing import Optional
 import torch
 
 from server.queue import RequestQueue, Request
-from server.model import get_tokenizer, get_model, get_model_device
+from server.model import get_tokenizer, get_model, get_model_device, decode_step_paged
+from server.kv_cache import BlockPool, SequenceKV, make_pool_from_model
 
 
 # ── per-sequence bookkeeping ──────────────────────────────────────────────────
@@ -153,3 +154,161 @@ class StaticBatchScheduler:
 
 def _send(req: Request, value) -> None:
     req.loop.call_soon_threadsafe(req.output_queue.put_nowait, value)
+
+
+# ── PagedContinuousBatchScheduler (Phase 5) ───────────────────────────────────
+
+@dataclass
+class PagedActiveSeq:
+    request:    Request
+    seq_kv:     SequenceKV
+    prompt_len: int
+    generated:  int = 0
+
+
+class PagedContinuousBatchScheduler:
+    """
+    Continuous batching + paged KV cache.
+
+    Differences from ContinuousBatchScheduler (Phase 4):
+    • Each sequence maintains a SequenceKV (paged blocks) rather than
+      accumulating the full token list.
+    • Prefill and decode go through decode_step_paged(), which reads/writes
+      KV via the block table.
+    • On eviction, blocks are immediately returned to the pool so waiting
+      sequences can use them.
+    """
+
+    def __init__(
+        self,
+        request_queue: RequestQueue,
+        pool: BlockPool | None = None,
+        max_batch: int = 8,
+    ):
+        self.request_queue = request_queue
+        self.max_batch     = max_batch
+        self._pool         = pool   # set before start() — or lazily in _loop
+        self._thread       = threading.Thread(target=self._loop, daemon=True)
+
+    def start(self) -> None:
+        self._thread.start()
+
+    @property
+    def pool(self) -> BlockPool:
+        return self._pool
+
+    # ── main loop ─────────────────────────────────────────────────────────────
+
+    def _loop(self) -> None:
+        from server.model import get_tokenizer, get_model_device
+        import torch
+        tokenizer = get_tokenizer()
+        device    = get_model_device()
+        eos_id    = tokenizer.eos_token_id
+
+        # Lazy pool init (model must be loaded first)
+        if self._pool is None:
+            self._pool = make_pool_from_model()
+
+        active: list[PagedActiveSeq] = []
+
+        while True:
+            # ── admit new requests ────────────────────────────────────────────
+            free  = self.max_batch - len(active)
+            block = len(active) == 0
+            new_reqs = self._admit(free, block=block)
+
+            for req in new_reqs:
+                seq = self._prefill(req, tokenizer, device, eos_id, active)
+                if seq is not None:
+                    active.append(seq)
+
+            if not active:
+                continue
+
+            # ── decode one step per active sequence ───────────────────────────
+            still_active: list[PagedActiveSeq] = []
+            for seq in active:
+                # cache_position: the position of the token we're about to generate
+                cur_len    = seq.prompt_len + seq.generated
+                cache_pos  = torch.tensor([cur_len], dtype=torch.long, device=device)
+                inp        = torch.tensor([[seq._last_tok]], dtype=torch.long, device=device)
+                attn_mask  = torch.ones((1, cur_len + 1), dtype=torch.long, device=device)
+
+                logits, _ = decode_step_paged(inp, attn_mask, seq.seq_kv, cache_pos)
+                tok = int(logits[0].argmax().item())
+                seq.generated    += 1
+                seq._last_tok     = tok
+                _send(seq.request, tok)
+
+                done = (tok == eos_id or seq.generated >= seq.request.max_tokens)
+                if done:
+                    _send(seq.request, None)
+                    seq.seq_kv.free()               # ← return blocks to pool
+                else:
+                    still_active.append(seq)
+
+            active = still_active
+
+    def _prefill(self, req: Request, tokenizer, device, eos_id: int, active: list) -> "PagedActiveSeq | None":
+        """
+        Tokenize, run prefill forward, store all prompt KV in paged blocks,
+        emit first generated token.  Returns None if the sequence is done
+        after the first token (i.e. EOS at step 0).
+        """
+        import torch
+        from server.model import decode_step
+
+        enc  = tokenizer(req.prompt, return_tensors="pt").to(device)
+        ids  = enc["input_ids"]
+        mask = enc["attention_mask"]
+        L    = ids.shape[1]
+
+        seq_kv    = SequenceKV(self._pool)
+        cache_pos = torch.arange(L, dtype=torch.long, device=device)
+
+        # Prefill: fill KV for all prompt tokens
+        from transformers import DynamicCache
+        past_kv   = DynamicCache()
+        logits, past_kv = decode_step(ids, mask, past_kv, cache_pos)
+
+        # Write ALL prompt tokens' KV to paged storage
+        for tok_pos in range(L):
+            seq_kv.write_token(past_kv, tok_pos)
+
+        # First generated token
+        tok = int(logits[0].argmax().item())
+        _send(req, tok)
+
+        if tok == eos_id or 1 >= req.max_tokens:
+            _send(req, None)
+            seq_kv.free()
+            return None
+
+        seq_obj           = PagedActiveSeq(request=req, seq_kv=seq_kv, prompt_len=L)
+        seq_obj._last_tok = tok
+        seq_obj.generated = 1
+        # Also write the first generated token's KV — it's NOT in past_kv yet
+        # because the first token is generated by the prefill logits, not a decode step.
+        # We do a mini decode step to fill it:
+        inp_first  = torch.tensor([[tok]], dtype=torch.long, device=device)
+        mask_first = torch.ones((1, L + 1), dtype=torch.long, device=device)
+        cp_first   = torch.tensor([L], dtype=torch.long, device=device)
+        decode_step_paged(inp_first, mask_first, seq_kv, cp_first)
+
+        return seq_obj
+
+    def _admit(self, n: int, block: bool) -> list[Request]:
+        if n <= 0:
+            return []
+        reqs: list[Request] = []
+        if block:
+            reqs.append(self.request_queue._q.get())
+            n -= 1
+        while n > 0:
+            try:
+                reqs.append(self.request_queue._q.get_nowait())
+                n -= 1
+            except Exception:
+                break
+        return reqs

@@ -18,7 +18,7 @@ from dotenv import load_dotenv
 
 from server.model import load_model, get_tokenizer
 from server.queue import RequestQueue, Request
-from server.scheduler import ContinuousBatchScheduler, StaticBatchScheduler
+from server.scheduler import ContinuousBatchScheduler, StaticBatchScheduler, PagedContinuousBatchScheduler
 
 load_dotenv()
 
@@ -76,6 +76,8 @@ async def startup():
     scheduler_type = os.environ.get("SCHEDULER", "continuous")
     if scheduler_type == "static":
         _scheduler = StaticBatchScheduler(_request_queue, max_batch=max_batch)
+    elif scheduler_type == "paged":
+        _scheduler = PagedContinuousBatchScheduler(_request_queue, max_batch=max_batch)
     else:
         _scheduler = ContinuousBatchScheduler(_request_queue, max_batch=max_batch)
     _scheduler.start()
