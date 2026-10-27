@@ -1,12 +1,15 @@
 # LLM Serving Platform
 
-A from-scratch LLM inference server with continuous batching and a paged KV cache, benchmarked against vLLM.
+A from-scratch LLM inference server (PyTorch + FastAPI) implementing continuous batching and a paged KV cache, benchmarked against vLLM.
 
 ## Stack
 
-- Python 3.11, PyTorch 2.4.x, Transformers 4.44.x, FastAPI + uvicorn
-- vLLM 0.6.x (comparison server)
-- Locust (load testing), W&B (experiment tracking), Prometheus + Grafana (observability)
+- **Server:** Python 3.12, PyTorch 2.x, Transformers 5.x, FastAPI + uvicorn
+- **Comparison:** vLLM (OpenAI-compatible endpoint, same model)
+- **Load testing:** Locust (mixed prompt lengths, deterministic seed)
+- **Experiment tracking:** W&B
+- **Observability:** Prometheus + Grafana (tokens/s, queue depth, batch size, KV utilization, TTFT)
+- **Deploy:** Docker Compose + Kubernetes (kind/k3d)
 
 ## Model
 
@@ -15,9 +18,10 @@ Set `MODEL_ID` in `.env`. Default: `Qwen/Qwen2.5-0.5B-Instruct`.
 ## Quick start
 
 ```bash
-cp .env.example .env
-pip install -r server/requirements.txt
-python scripts/smoke.py        # Phase 0 acceptance check
+cp .env.example .env          # set MODEL_ID if needed
+pip install -r requirements.txt
+python scripts/smoke.py        # model loads and generates one token
+uvicorn server.api:app --port 8000
 ```
 
 ## Build phases
@@ -29,25 +33,121 @@ python scripts/smoke.py        # Phase 0 acceptance check
 | 2 | SSE streaming | ✅ |
 | 3 | Static batching | ✅ |
 | 4 | Continuous batching | ✅ |
-| 5 | Paged KV cache | 🔲 |
-| 6 | vLLM + benchmark + observability | 🔲 |
-| 7 | Kubernetes deploy | 🔲 |
+| 5 | Paged KV cache | ✅ |
+| 6 | vLLM + benchmark + observability | ✅ |
+| 7 | Kubernetes deploy | ✅ |
+
+## Architecture
+
+```
+client
+  │  POST /v1/chat/completions
+  ▼
+FastAPI (api.py)
+  │  enqueues Request
+  ▼
+RequestQueue  ──►  Scheduler (static | continuous | paged)
+                       │
+                       │  every decode step
+                       ▼
+                   model.py  ──►  Transformers model forward
+                       │
+                       │  KV cache (paged, Phase 5)
+                       ▼
+                   SequenceKV / BlockPool (kv_cache.py)
+```
+
+Three scheduler variants selectable via `SCHEDULER` env var:
+
+| `SCHEDULER` | Strategy | KV cache |
+|------------|----------|----------|
+| `static` | Wait for full batch, run to completion | contiguous |
+| `continuous` | Admit new requests as slots free | contiguous |
+| `paged` | Continuous batching + paged KV blocks | paged blocks |
 
 ## Benchmark results
 
-### Phase 4 — Continuous batching latency (CPU, Qwen2.5-0.5B-Instruct)
+### Phase 4 — Mixed-length latency (CPU, Qwen2.5-0.5B-Instruct)
 
 Short request arriving 2s after a long request is already running:
 
-| Scheduler | SHORT latency | LONG latency | Notes |
-|-----------|--------------|--------------|-------|
-| Static batching (Phase 3) | 12.2s | 12.2s | SHORT blocks until LONG finishes |
-| Continuous batching (Phase 4) | **4.8s** | 27.4s | SHORT joins running batch immediately |
+| Scheduler | Short-request latency | Long-request latency |
+|-----------|----------------------|----------------------|
+| Static (Phase 3) | 12.2 s | 12.2 s |
+| Continuous (Phase 4) | **4.8 s** | 27.4 s |
 
-**2.55x speedup** for short-request latency.
+**2.55× lower latency** for the short request under continuous batching.
 
-_Full throughput benchmark (Locust + GPU) to be filled after Phase 6._
+### Phase 6 — Full throughput sweep
+
+_Run after starting all three servers:_
+
+```bash
+# Start servers (three terminals):
+SCHEDULER=static  uvicorn server.api:app --port 8002
+SCHEDULER=paged   uvicorn server.api:app --port 8003
+source .env && bash vllm/run.sh   # port 8001
+
+# Sweep:
+python bench/run_bench.py \
+  --static-url http://localhost:8002 \
+  --paged-url  http://localhost:8003 \
+  --vllm-url   http://localhost:8001 \
+  --concurrency 1 8 32 \
+  --wandb-project llm-serving-platform
+
+# Charts:
+python bench/plot.py   # writes bench/charts/*.png
+```
+
+_Fill real numbers here after running on GPU hardware._
+
+| Concurrency | Static (tok/s) | Paged (tok/s) | vLLM (tok/s) |
+|-------------|---------------|--------------|--------------|
+| 1 | — | — | — |
+| 8 | — | — | — |
+| 32 | — | — | — |
+
+## Running the observability stack
+
+```bash
+docker compose up prometheus grafana
+# Grafana: http://localhost:3000  (admin/admin)
+# Dashboard: "LLM Serving Platform" (auto-provisioned)
+```
+
+## Kubernetes (kind / k3d)
+
+```bash
+kind create cluster --name llm-serving
+docker build -t llm-serving-platform:latest .
+kind load docker-image llm-serving-platform:latest --name llm-serving
+kubectl apply -f k8s/
+kubectl port-forward svc/llm-server-nodeport 8000:8000 -n llm-serving
+curl http://localhost:8000/health
+```
+
+See [`k8s/README.md`](k8s/README.md) for the readiness-probe war story and GPU notes.
+
+## Correctness tests
+
+```bash
+pytest tests/test_correctness.py -v
+# 4 tests: single-request, batched, KV-cache decode, paged KV-cache decode
+# All must match the saved baseline token-for-token.
+```
 
 ## Hardware
 
-_Document GPU / CPU used for final benchmark here._
+_Document GPU / CPU used for final benchmark here (model, VRAM, driver version)._
+
+## Key design decisions
+
+**Why a `startupProbe` instead of `initialDelaySeconds` in K8s?**  
+`initialDelaySeconds` is a blind wait. A `startupProbe` with `failureThreshold=30 × periodSeconds=10` gives a 300-second budget that adapts to actual readiness — the pod becomes Ready exactly when the model finishes loading, never sooner.
+
+**Why paged KV over contiguous?**  
+Contiguous allocation reserves `max_seq_len × num_layers × 2 × head_dim` bytes per sequence at admission time. Paged allocation uses only the blocks actually filled, so a 10-token sequence uses ~10/block_size blocks rather than a full `max_seq_len`-sized buffer — higher effective concurrency in fixed VRAM.
+
+**Why not import vLLM in the from-scratch server?**  
+The point of the project is to build and understand the mechanisms. The from-scratch server imports only PyTorch and Transformers for model + tokenizer; all batching and cache logic is original.
