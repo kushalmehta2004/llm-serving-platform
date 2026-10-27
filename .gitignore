@@ -24,6 +24,7 @@ tests/baseline.json
 # Logs / outputs
 *.log
 *.txt
+!requirements.txt
 wandb/
 
 # OS

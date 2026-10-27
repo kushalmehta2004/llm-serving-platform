@@ -21,11 +21,19 @@ import threading
 from dataclasses import dataclass, field
 from typing import Optional
 
+import time
+
 import torch
 
 from server.queue import RequestQueue, Request
 from server.model import get_tokenizer, get_model, get_model_device, decode_step_paged
 from server.kv_cache import BlockPool, SequenceKV, make_pool_from_model
+
+try:
+    from server.metrics import tokens_generated, queue_depth, active_batch_size, kv_utilization, request_latency, ttft
+    _METRICS = True
+except Exception:
+    _METRICS = False
 
 
 # ── per-sequence bookkeeping ──────────────────────────────────────────────────
@@ -72,6 +80,10 @@ class ContinuousBatchScheduler:
 
             if not active:
                 continue
+
+            if _METRICS:
+                active_batch_size.set(len(active))
+                queue_depth.set(self.request_queue._q.qsize())
 
             # ── build left-padded batch ───────────────────────────────────────
             max_len = max(len(s.token_ids) for s in active)
@@ -153,6 +165,8 @@ class StaticBatchScheduler:
 # ── helpers ───────────────────────────────────────────────────────────────────
 
 def _send(req: Request, value) -> None:
+    if _METRICS and value is not None:
+        tokens_generated.inc()
     req.loop.call_soon_threadsafe(req.output_queue.put_nowait, value)
 
 
@@ -225,6 +239,11 @@ class PagedContinuousBatchScheduler:
 
             if not active:
                 continue
+
+            if _METRICS:
+                active_batch_size.set(len(active))
+                queue_depth.set(self.request_queue._q.qsize())
+                kv_utilization.set(self._pool.utilization)
 
             # ── decode one step per active sequence ───────────────────────────
             still_active: list[PagedActiveSeq] = []

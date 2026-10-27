@@ -1,6 +1,77 @@
 version: "3.9"
 
-# TODO phase 1 — add 'server' service
-# TODO phase 6 — add 'vllm', 'prometheus', 'grafana' services
+# Phase 6 — full serving + observability stack.
+#
+# Usage:
+#   docker compose up --build
+#
+# Services:
+#   server     — from-scratch LLM server (Phase 5, SCHEDULER=paged)
+#   vllm       — vLLM OpenAI-compatible server (requires GPU)
+#   prometheus — scrapes /metrics from server + vllm
+#   grafana    — dashboards at http://localhost:3000 (admin/admin)
 
-services: {}
+services:
+
+  server:
+    build: .
+    command: uvicorn server.api:app --host 0.0.0.0 --port 8000
+    environment:
+      - MODEL_ID=${MODEL_ID:-Qwen/Qwen2.5-0.5B-Instruct}
+      - SCHEDULER=${SCHEDULER:-paged}
+      - MAX_BATCH=${MAX_BATCH:-8}
+    ports:
+      - "8000:8000"
+    volumes:
+      - ~/.cache/huggingface:/root/.cache/huggingface
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+
+  vllm:
+    image: vllm/vllm-openai:latest
+    command: >
+      --model ${MODEL_ID:-Qwen/Qwen2.5-0.5B-Instruct}
+      --port 8001
+      --host 0.0.0.0
+      --max-num-seqs 256
+      --gpu-memory-utilization 0.45
+    environment:
+      - HUGGING_FACE_HUB_TOKEN=${HF_TOKEN:-}
+    ports:
+      - "8001:8001"
+    volumes:
+      - ~/.cache/huggingface:/root/.cache/huggingface
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+
+  prometheus:
+    image: prom/prometheus:v2.52.0
+    volumes:
+      - ./observability/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    ports:
+      - "9090:9090"
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+
+  grafana:
+    image: grafana/grafana:10.4.2
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=admin
+      - GF_AUTH_ANONYMOUS_ENABLED=true
+    volumes:
+      - ./observability/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./observability/grafana/dashboards:/var/lib/grafana/dashboards:ro
+    ports:
+      - "3000:3000"
+    depends_on:
+      - prometheus

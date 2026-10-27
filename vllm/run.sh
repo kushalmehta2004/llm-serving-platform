@@ -1,3 +1,27 @@
 #!/usr/bin/env bash
-# TODO phase 6 — serve the same MODEL_ID via vLLM
-# vllm serve "$MODEL_ID" --port "${VLLM_PORT:-8001}"
+# Phase 6 — serve the same MODEL_ID via vLLM (OpenAI-compatible endpoint).
+#
+# Usage:
+#   source .env && bash vllm/run.sh
+#   VLLM_PORT=8001 bash vllm/run.sh
+#
+# Tuning knobs:
+#   --max-num-seqs        max concurrent sequences (default: 256)
+#   --gpu-memory-utilization  fraction of GPU VRAM to reserve for KV cache (default: 0.90)
+#   --max-model-len       context window; reduce to save memory on small GPUs
+
+set -euo pipefail
+
+: "${MODEL_ID:?Set MODEL_ID in .env or environment}"
+PORT="${VLLM_PORT:-8001}"
+
+echo "Starting vLLM server: model=$MODEL_ID  port=$PORT"
+
+python -m vllm.entrypoints.openai.api_server \
+    --model "$MODEL_ID" \
+    --port "$PORT" \
+    --host 0.0.0.0 \
+    --max-num-seqs 256 \
+    --gpu-memory-utilization 0.90 \
+    --dtype auto \
+    --served-model-name "$MODEL_ID"

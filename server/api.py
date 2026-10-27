@@ -19,6 +19,7 @@ from dotenv import load_dotenv
 from server.model import load_model, get_tokenizer
 from server.queue import RequestQueue, Request
 from server.scheduler import ContinuousBatchScheduler, StaticBatchScheduler, PagedContinuousBatchScheduler
+from server.metrics import metrics_app
 
 load_dotenv()
 
@@ -205,3 +206,7 @@ async def chat_completions(req: ChatCompletionRequest):
 @app.get("/health")
 async def health():
     return {"status": "ok"}
+
+
+# Mount Prometheus metrics at /metrics
+app.mount("/metrics", metrics_app)
